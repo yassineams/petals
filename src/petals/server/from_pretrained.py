@@ -20,7 +20,31 @@ from hivemind.utils.logging import get_logger
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import PretrainedConfig, PreTrainedModel
-from transformers.utils import get_file_from_repo
+try:
+    from transformers.utils import get_file_from_repo
+except ImportError:
+    try:
+        from transformers.utils import cached_file
+    except ImportError:
+        from transformers.utils.hub import cached_file
+
+    def get_file_from_repo(path_or_repo, filename, **kwargs):
+        # get_file_from_repo export removed in transformers 4.50+,
+        # function removed by ~4.52. It was a thin wrapper around
+        # cached_file with exceptions suppressed.
+        token = kwargs.pop("token", None)
+        legacy = kwargs.pop("use_auth_token", None)
+        if token is None:
+            token = legacy
+        return cached_file(
+            path_or_repo,
+            filename,
+            token=token,
+            _raise_exceptions_for_gated_repo=False,
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+            **kwargs,
+        )
 
 from petals.constants import DTYPE_MAP
 from petals.models.mixtral import WrappedMixtralBlock
