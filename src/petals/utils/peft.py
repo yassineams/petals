@@ -15,7 +15,31 @@ from peft.tuners import lora
 from peft.utils import CONFIG_NAME, SAFETENSORS_WEIGHTS_NAME
 from safetensors import safe_open
 from safetensors.torch import load_file
-from transformers.utils import get_file_from_repo
+try:
+    from transformers.utils import get_file_from_repo
+except ImportError:
+    try:
+        from transformers.utils import cached_file
+    except ImportError:
+        from transformers.utils.hub import cached_file
+
+    def get_file_from_repo(path_or_repo, filename, **kwargs):
+        # get_file_from_repo export removed in transformers 4.50+,
+        # function removed by ~4.52. It was a thin wrapper around
+        # cached_file with exceptions suppressed.
+        token = kwargs.pop("token", None)
+        legacy = kwargs.pop("use_auth_token", None)
+        if token is None:
+            token = legacy
+        return cached_file(
+            path_or_repo,
+            filename,
+            token=token,
+            _raise_exceptions_for_gated_repo=False,
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+            **kwargs,
+        )
 
 from petals.server.block_utils import get_model_block, resolve_block_dtype
 from petals.utils.convert_block import QuantType

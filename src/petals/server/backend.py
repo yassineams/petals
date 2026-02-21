@@ -68,7 +68,7 @@ class TransformerBackend(ModuleBackend):
         for shard in self.module.module_shards:
             for submodule in shard.modules():
                 if isinstance(submodule, config.attn_class):
-                    self.shard_num_heads.append(submodule.num_heads)
+                    self.shard_num_heads.append(self._get_num_heads(submodule, config))
         assert len(self.shard_num_heads) == len(self.module.devices)
         assert sum(self.shard_num_heads) == config.num_attention_heads
 
@@ -84,6 +84,20 @@ class TransformerBackend(ModuleBackend):
         self.cache_bytes_per_token: Dict[torch.device, int] = Counter()
         for descr in self.get_inference_cache_descriptors(batch_size=1, max_length=1):
             self.cache_bytes_per_token[descr.device] += descr.numel() * get_size_in_bytes(descr.dtype)
+
+    @staticmethod
+    def _get_num_heads(attn_module, config: PretrainedConfig) -> int:
+        """Derive num_heads from attention module, preferring weight shapes over config."""
+        if hasattr(attn_module, "num_heads"):
+            return attn_module.num_heads
+        if hasattr(attn_module, "q_proj"):
+            head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+            return attn_module.q_proj.out_features // head_dim
+        logger.warning(
+            "Could not derive num_heads from %s; using config.num_attention_heads=%d",
+            type(attn_module).__name__, config.num_attention_heads,
+        )
+        return config.num_attention_heads
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step"""

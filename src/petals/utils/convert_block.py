@@ -115,6 +115,20 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
     return model
 
 
+def _get_num_heads(attn_module: nn.Module, config: PretrainedConfig) -> int:
+    """Derive num_heads from attention module, preferring weight shapes over config."""
+    if hasattr(attn_module, "num_heads"):
+        return attn_module.num_heads
+    if hasattr(attn_module, "q_proj"):
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        return attn_module.q_proj.out_features // head_dim
+    logger.warning(
+        "Could not derive num_heads from %s; using config.num_attention_heads=%d",
+        type(attn_module).__name__, config.num_attention_heads,
+    )
+    return config.num_attention_heads
+
+
 def make_tensor_parallel(
     block: nn.Module, model_config: PretrainedConfig, devices: Sequence[torch.device], output_device: torch.device
 ) -> nn.Module:
@@ -130,7 +144,7 @@ def make_tensor_parallel(
     for tp_shard in tp_block.module_shards:
         for submodule in tp_shard.modules():
             if isinstance(submodule, model_config.attn_class):
-                total_heads += submodule.num_heads
+                total_heads += _get_num_heads(submodule, model_config)
     assert total_heads == model_config.num_attention_heads
     return tp_block
 

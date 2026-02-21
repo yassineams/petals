@@ -33,6 +33,23 @@ class OptimizedLlamaAttention(LlamaAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._rotary_graph = None
+        # num_heads/num_key_value_heads/head_dim removed from transformers attention classes in 4.45+
+        if not hasattr(self, "head_dim"):
+            self.head_dim = getattr(
+                self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads
+            )
+        if not hasattr(self, "num_heads"):
+            if hasattr(self, "q_proj"):
+                self.num_heads = self.q_proj.out_features // self.head_dim
+            else:
+                self.num_heads = self.config.num_attention_heads
+        if not hasattr(self, "num_key_value_heads"):
+            if hasattr(self, "k_proj"):
+                self.num_key_value_heads = self.k_proj.out_features // self.head_dim
+            else:
+                self.num_key_value_heads = getattr(
+                    self.config, "num_key_value_heads", self.config.num_attention_heads
+                )
 
     def _optimized_apply_rotary(self, query_states, key_states, cos, sin):
         if self._rotary_graph is None:
