@@ -1,3 +1,4 @@
+import inspect
 from typing import Optional, Union
 
 import torch
@@ -53,13 +54,51 @@ def get_block_size(
     return round(n_params * bytes_per_value * (1 + eps))
 
 
+def _accepts_layer_idx(cls):
+    """Check if block class constructor accepts layer_idx."""
+    try:
+        sig = inspect.signature(cls.__init__)
+    except (TypeError, ValueError):
+        return None  # Can't determine — caller should try/except
+    params = sig.parameters
+    if "layer_idx" in params:
+        return True
+    if any(p.kind == p.VAR_KEYWORD for p in params.values()):
+        return True
+    return False
+
+
 def get_model_block(config, layer_idx: int = 0):
     """
-    The function to create a model block based on the block class
-    kwargs argument **only** is necessary for specific classes, like Mixtral.
-    They will not be passed to other block constructors.
+    Create a model block based on the block class, passing layer_idx
+    to all block constructors that accept it.
     """
     if config.block_class == WrappedMixtralBlock:
-        config = PreTrainedModel._autoset_attn_implementation(config)
-        return config.block_class(config, layer_idx)
-    return config.block_class(config)
+        if hasattr(PreTrainedModel, "_autoset_attn_implementation"):
+            config = PreTrainedModel._autoset_attn_implementation(config)
+        elif getattr(config, "_attn_implementation", None) is None:
+            config._attn_implementation = "eager"
+
+    accepts = _accepts_layer_idx(config.block_class)
+    if accepts is True:
+        try:
+            return config.block_class(config, layer_idx=layer_idx)
+        except TypeError as e:
+            msg = str(e)
+            if "unexpected keyword argument" in msg and "layer_idx" in msg:
+                return config.block_class(config)
+            raise
+    elif accepts is False:
+        return config.block_class(config)
+    else:
+        # Signature inspection failed — try with layer_idx, fallback without
+        try:
+            return config.block_class(config, layer_idx=layer_idx)
+        except TypeError as e:
+            msg = str(e)
+            if "unexpected keyword argument" in msg and "layer_idx" in msg:
+                return config.block_class(config)
+            raise
+
+
+get_model_block._universal_layer_idx = True

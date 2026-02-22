@@ -55,6 +55,118 @@ from petals.utils.hf_auth import always_needs_auth
 
 logger = get_logger(__name__)
 
+_MXFP4_EXPERT_PAIRS = [
+    ("mlp.experts.gate_up_proj", "_blocks", "_scales"),
+    ("mlp.experts.down_proj", "_blocks", "_scales"),
+]
+
+
+def _synthesize_mxfp4_state_dict(state_dict, config=None):
+    """Materialize dense expert params from MXFP4-packed keys in state dict.
+
+    GPT-OSS safetensors store MXFP4-packed keys (*_blocks/*_scales) instead of
+    dense parameter names. This converts them to dense tensors so
+    load_pretrained_block can find the expected keys.
+
+    Modifies state_dict in place. Returns list of converted key names.
+    """
+    pairs_to_convert = []
+    for base, blk_sfx, scl_sfx in _MXFP4_EXPERT_PAIRS:
+        blk_key = base + blk_sfx
+        scl_key = base + scl_sfx
+        if blk_key in state_dict and scl_key in state_dict:
+            pairs_to_convert.append((base, blk_key, scl_key))
+
+    if not pairs_to_convert:
+        return []
+
+    gate_bases = [b for b, _, _ in pairs_to_convert if "gate_up_proj" in b]
+    if not gate_bases:
+        raise RuntimeError(
+            "Cannot determine MXFP4 layout without gate_up_proj — "
+            "file an issue with your model name and transformers version"
+        )
+
+    hidden_size = getattr(config, "hidden_size", None) if config else None
+    intermediate_size = getattr(config, "intermediate_size", None) if config else None
+
+    needs_transpose = None
+    _convert_fn = None
+
+    converted = []
+    for base, blk_key, scl_key in pairs_to_convert:
+        if base in state_dict:
+            logger.debug("Skipping MXFP4 synthesis for %s: dense key already present", base)
+            del state_dict[blk_key]
+            del state_dict[scl_key]
+            converted.append(base)
+            continue
+
+        blocks = state_dict[blk_key]
+        scales = state_dict[scl_key]
+
+        if blocks.dtype != torch.uint8 or scales.dtype != torch.uint8:
+            raise RuntimeError(
+                f"MXFP4 dtype mismatch for {base}: "
+                f"blocks.dtype={blocks.dtype}, scales.dtype={scales.dtype} "
+                f"(expected both torch.uint8)"
+            )
+
+        if _convert_fn is None:
+            try:
+                from transformers.integrations.mxfp4 import convert_moe_packed_tensors
+                _convert_fn = convert_moe_packed_tensors
+            except (ImportError, ModuleNotFoundError):
+                raise RuntimeError(
+                    "MXFP4 packed keys detected in state dict but "
+                    "transformers.integrations.mxfp4.convert_moe_packed_tensors not available. "
+                    "This requires transformers>=4.55.1 with MXFP4 support."
+                )
+
+        try:
+            dense = _convert_fn(blocks, scales)
+        except torch.cuda.OutOfMemoryError:
+            raise RuntimeError(
+                f"MXFP4 conversion OOM for {base} — try "
+                f"CUDA_VISIBLE_DEVICES='' to force CPU conversion, "
+                f"or free GPU memory"
+            )
+
+        if "gate_up_proj" in base and needs_transpose is None:
+            if (hidden_size is not None and intermediate_size is not None
+                    and dense.ndim == 3):
+                expected_d1 = hidden_size
+                expected_d2 = 2 * intermediate_size
+                if dense.shape[1] == expected_d1 and dense.shape[2] == expected_d2:
+                    needs_transpose = False
+                elif dense.shape[1] == expected_d2 and dense.shape[2] == expected_d1:
+                    needs_transpose = True
+                else:
+                    logger.warning(
+                        "MXFP4 gate_up_proj shape %s doesn't match expected dims — skipping transpose",
+                        dense.shape,
+                    )
+                    needs_transpose = False
+            else:
+                needs_transpose = False
+        elif "gate_up_proj" not in base and needs_transpose is None:
+            raise RuntimeError(
+                "Cannot determine MXFP4 layout without gate_up_proj — "
+                "file an issue with your model name and transformers version"
+            )
+
+        if needs_transpose and dense.ndim == 3:
+            dense = dense.transpose(1, 2).contiguous()
+
+        state_dict[base] = dense
+        del state_dict[blk_key]
+        del state_dict[scl_key]
+
+        logger.info("MXFP4: synthesized %s (%s)", base.rsplit(".", 1)[-1], dense.dtype)
+        converted.append(base)
+
+    return converted
+
 
 def load_pretrained_block(
     model_name: str,
@@ -87,6 +199,7 @@ def load_pretrained_block(
         cache_dir=cache_dir,
         max_disk_space=max_disk_space,
     )
+    _synthesize_mxfp4_state_dict(state_dict, config=config)
 
     for param_name, _ in block.named_parameters():
         assert param_name in state_dict, f"{param_name} not in state dict"
